@@ -11,9 +11,19 @@ public static class Converter {
     public static int ConvertFile(string input, string output) {
         if (String.Equals(Path.GetFullPath(input), Path.GetFullPath(output), StringComparison.OrdinalIgnoreCase))
             throw new InvalidOperationException("Choose an output file different from the input file.");
+        var points = ExtractSurface(input);
+        string temp = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(output)), ".airfoil-" + Guid.NewGuid().ToString("N") + ".tmp");
+        try {
+            using (var writer = new StreamWriter(temp, false, new UTF8Encoding(false)))
+                foreach (var p in points) writer.WriteLine(Format(p[0]) + "mm\t" + Format(p[1]) + "mm\t0mm");
+            if (File.Exists(output)) File.Replace(temp, output, null); else File.Move(temp, output);
+        } finally { if (File.Exists(temp)) File.Delete(temp); }
+        return points.Count;
+    }
+    public static List<double[]> ExtractSurface(string path) {
         var points = new List<double[]>();
         bool surface = false;
-        using (var reader = new StreamReader(input, Encoding.UTF8, true)) {
+        using (var reader = new StreamReader(path, Encoding.UTF8, true)) {
             string line;
             while ((line = reader.ReadLine()) != null) {
                 string[] row = ParseLine(line);
@@ -27,13 +37,43 @@ public static class Converter {
             }
         }
         if (points.Count == 0) throw new InvalidDataException("No points were found in the 'Airfoil surface' section.");
-        string temp = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(output)), ".airfoil-" + Guid.NewGuid().ToString("N") + ".tmp");
-        try {
-            using (var writer = new StreamWriter(temp, false, new UTF8Encoding(false)))
-                foreach (var p in points) writer.WriteLine(Format(p[0]) + "mm\t" + Format(p[1]) + "mm\t0mm");
-            if (File.Exists(output)) File.Replace(temp, output, null); else File.Move(temp, output);
-        } finally { if (File.Exists(temp)) File.Delete(temp); }
-        return points.Count;
+        return points;
+    }
+    // The airfoil contour is expected to run from trailing edge to leading edge and back.
+    // Compare the two piecewise-linear surfaces at common X coordinates.
+    public static double? MaximumThickness(string path) {
+        var p = ExtractSurface(path);
+        if (p.Count < 3) return null;
+        int leading = 0;
+        for (int i = 0; i < p.Count; i++) {
+            if (Double.IsNaN(p[i][0]) || Double.IsInfinity(p[i][0]) || Double.IsNaN(p[i][1]) || Double.IsInfinity(p[i][1])) return null;
+            if (p[i][0] < p[leading][0]) leading = i;
+        }
+        if (leading == 0 || leading == p.Count - 1) return null;
+        const double eps = 1e-10;
+        for (int i = 1; i <= leading; i++) if (p[i][0] > p[i - 1][0] + eps) return null;
+        for (int i = leading + 1; i < p.Count; i++) if (p[i][0] < p[i - 1][0] - eps) return null;
+        double minX = p[leading][0], maxX = Math.Min(p[0][0], p[p.Count - 1][0]);
+        if (maxX <= minX + eps) return null;
+        double maxThickness = 0;
+        foreach (var point in p) {
+            double x = point[0]; if (x < minX - eps || x > maxX + eps) continue;
+            double minA, maxA, minB, maxB;
+            if (Intersections(p, 0, leading, x, out minA, out maxA) && Intersections(p, leading, p.Count - 1, x, out minB, out maxB))
+                maxThickness = Math.Max(maxThickness, Math.Max(Math.Abs(maxA - minB), Math.Abs(maxB - minA)));
+        }
+        return maxThickness;
+    }
+    static bool Intersections(List<double[]> p, int first, int last, double x, out double min, out double max) {
+        min = Double.PositiveInfinity; max = Double.NegativeInfinity;
+        const double eps = 1e-10;
+        for (int i = first; i < last; i++) {
+            var a = p[i]; var b = p[i + 1];
+            if (x < Math.Min(a[0], b[0]) - eps || x > Math.Max(a[0], b[0]) + eps) continue;
+            if (Math.Abs(a[0] - b[0]) <= eps) { min = Math.Min(min, Math.Min(a[1], b[1])); max = Math.Max(max, Math.Max(a[1], b[1])); }
+            else { double y = a[1] + (x - a[0]) * (b[1] - a[1]) / (b[0] - a[0]); min = Math.Min(min, y); max = Math.Max(max, y); }
+        }
+        return !Double.IsInfinity(min);
     }
     public static Dictionary<string, string> ReadMetadata(string path) {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -68,9 +108,9 @@ public static class Converter {
 public class MainForm : Form {
     TextBox source = new TextBox(), destination = new TextBox();
     Label status = new Label(), drop = new Label();
-    Label[] metadataValues = new Label[6];
+    Label[] metadataValues = new Label[7];
     public MainForm() {
-        Text = "Airfoil to SolidWorks"; ClientSize = new Size(620, 540); MinimumSize = new Size(550, 570); BackColor = Color.White; AutoScaleMode = AutoScaleMode.Font;
+        Text = "Airfoil to SolidWorks"; ClientSize = new Size(620, 590); MinimumSize = new Size(550, 620); BackColor = Color.White; AutoScaleMode = AutoScaleMode.Font;
         StartPosition = FormStartPosition.CenterScreen; Font = new Font("Segoe UI", 9F); ForeColor = Color.FromArgb(36, 48, 65); AllowDrop = true;
         var heading = new Label { Text = "Airfoil to SolidWorks", Font = new Font("Segoe UI", 17F, FontStyle.Bold), AutoSize = true, Location = new Point(20, 15) };
         var subtitle = new Label { Text = "Convert AirfoilTools coordinates into a SolidWorks curve file.", ForeColor = Color.FromArgb(100, 116, 139), AutoSize = true, Location = new Point(23, 51) };
@@ -83,13 +123,13 @@ public class MainForm : Form {
         var outLabel = new Label { Text = "Save as", AutoSize = true, Location = new Point(20, 245) };
         destination.SetBounds(23, 267, 475, 25); destination.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
         var save = new Button { Text = "Browse...", Location = new Point(508, 265), Size = new Size(89, 28), Anchor = AnchorStyles.Top | AnchorStyles.Right };
-        var convert = new Button { Text = "Convert", Location = new Point(483, 474), Size = new Size(114, 36), Anchor = AnchorStyles.Bottom | AnchorStyles.Right, BackColor = Color.FromArgb(30, 105, 175), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
-        status.SetBounds(23, 473, 445, 43); status.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right; status.Text = "Select a CSV file to get started.";
+        var convert = new Button { Text = "Convert", Location = new Point(483, 524), Size = new Size(114, 36), Anchor = AnchorStyles.Bottom | AnchorStyles.Right, BackColor = Color.FromArgb(30, 105, 175), ForeColor = Color.White, FlatStyle = FlatStyle.Flat };
+        status.SetBounds(23, 523, 445, 43); status.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right; status.Text = "Select a CSV file to get started.";
         var metadataTitle = new Label { Text = "AIRFOIL DETAILS", Font = new Font("Segoe UI", 9F, FontStyle.Bold), ForeColor = Color.FromArgb(100, 116, 139), AutoSize = true, Location = new Point(20, 312) };
-        var details = new TableLayoutPanel { Location = new Point(23, 339), Size = new Size(574, 105), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, ColumnCount = 3, RowCount = 2, BackColor = Color.FromArgb(245, 249, 255), Padding = new Padding(10, 6, 10, 4) };
+        var details = new TableLayoutPanel { Location = new Point(23, 339), Size = new Size(574, 155), Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right, ColumnCount = 3, RowCount = 3, BackColor = Color.FromArgb(245, 249, 255), Padding = new Padding(10, 6, 10, 4) };
         for (int i = 0; i < 3; i++) details.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333F));
-        details.RowStyles.Add(new RowStyle(SizeType.Percent, 50)); details.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        string[] captions = { "Name", "Chord (mm)", "Radius (mm)", "Thickness (%)", "Origin (%)", "Pitch (deg)" };
+        for (int i = 0; i < 3; i++) details.RowStyles.Add(new RowStyle(SizeType.Percent, 33.333F));
+        string[] captions = { "Name", "Chord (mm)", "Radius (mm)", "Thickness (%)", "Origin (%)", "Pitch (deg)", "Max thickness (mm)" };
         for (int i = 0; i < captions.Length; i++) {
             var box = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0) };
             var caption = new Label { Text = captions[i], Font = new Font("Segoe UI", 8F), ForeColor = Color.FromArgb(100, 116, 139), AutoSize = true, Location = new Point(3, 0) };
@@ -122,6 +162,7 @@ public class MainForm : Form {
             var metadata = Converter.ReadMetadata(path);
             string[] keys = { "Name", "Chord(mm)", "Radius(mm)", "Thickness(%)", "Origin(%)", "Pitch(deg)" };
             for (int i = 0; i < keys.Length; i++) { string value; if (metadata.TryGetValue(keys[i], out value)) metadataValues[i].Text = value; }
+            try { double? thickness = Converter.MaximumThickness(path); if (thickness.HasValue) metadataValues[6].Text = thickness.Value.ToString("0.###", CultureInfo.InvariantCulture); } catch (InvalidDataException) { }
             status.ForeColor = SystemColors.ControlText; status.Text = "Ready to convert.";
         } catch (Exception ex) {
             status.ForeColor = Color.Firebrick; status.Text = "Could not read the selected file.";
@@ -132,6 +173,7 @@ public class MainForm : Form {
     void OnDrop(object sender, DragEventArgs e) { var files = (string[])e.Data.GetData(DataFormats.FileDrop); if (files != null && files.Length > 0) { if (files.Length != 1 || !String.Equals(Path.GetExtension(files[0]), ".csv", StringComparison.OrdinalIgnoreCase)) MessageBox.Show(this, "Please drop one CSV file.", "Select a CSV file", MessageBoxButtons.OK, MessageBoxIcon.Information); else SetSource(files[0]); } }
     [STAThread] static void Main() { Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false); Application.Run(new MainForm()); }
 }
+
 
 
 
